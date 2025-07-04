@@ -1,7 +1,22 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 app = FastAPI()
+
+# libera acesso da tua UI
+origins = [
+    "https://kiti.dev",         # teu domínio
+    "http://localhost:5500",    # pra testar local
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,      # ou ["*"] se quiser liberar geral
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # banco de dados fake na memória
 tasks = []
@@ -22,7 +37,6 @@ def get_tasks():
 
 @app.post("/tasks")
 def create_task(task: Task):
-    # checa se id já existe
     if any(t["id"] == task.id for t in tasks):
         raise HTTPException(status_code=400, detail="id já existe, doido!")
     tasks.append(task.dict())
