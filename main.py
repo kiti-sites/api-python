@@ -1,5 +1,6 @@
 import json
 from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm, OAuth2PasswordBearer
 from passlib.context import CryptContext
 from pydantic import BaseModel
@@ -21,7 +22,6 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 USERS_FILE = Path("users.json")
 TASKS_FILE = Path("tasks.json")
 
-# helpers pra ler e salvar json
 def load_json(file_path):
     if not file_path.exists():
         return {}
@@ -50,7 +50,6 @@ class TaskUpdate(BaseModel):
     done: Optional[bool] = None
     title: Optional[str] = None
 
-# utils senha e token
 def verify_password(plain, hashed):
     return pwd_context.verify(plain, hashed)
 
@@ -65,10 +64,7 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
 
 def get_user(username: str):
     users = load_json(USERS_FILE)
-    user = users.get(username)
-    if user:
-        return user
-    return None
+    return users.get(username)
 
 def authenticate_user(username: str, password: str):
     user = get_user(username)
@@ -96,8 +92,21 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
         raise credentials_ex
     return username
 
-# rotas
+# CORS
+origins = [
+    "https://kiti.dev",
+    "http://localhost:5500",
+]
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# rotas
 @app.post("/register")
 def register(user_in: UserIn):
     users = load_json(USERS_FILE)
