@@ -1,196 +1,162 @@
-from fastapi import FastAPI, HTTPException, Depends, status
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from pydantic import BaseModel
-from typing import Optional, List
-from passlib.context import CryptContext
-from jose import JWTError, jwt
 import json
+from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi.security import OAuth2PasswordRequestForm, OAuth2PasswordBearer
+from passlib.context import CryptContext
+from pydantic import BaseModel
+from typing import List, Optional
+from jose import JWTError, jwt
 from datetime import datetime, timedelta
-import os
+from pathlib import Path
 
 app = FastAPI()
 
-# CORS (libera acesso do frontend)
-origins = [
-    "https://kiti.dev",
-    "http://localhost:5500",
-]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# secret pros tokens
-SECRET_KEY = "esseéumsegredomuitoseguro!"
+# configs token
+SECRET_KEY = "supersecreto123"
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
-# pwd hashing
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
-# admin hardcoded
-ADMIN_USERNAME = "admin"
-ADMIN_PASSWORD = "senha123"  # troca essa senha aqui
+USERS_FILE = Path("users.json")
+TASKS_FILE = Path("tasks.json")
 
-# usuários comuns ficam num json
-USERS_FILE = "users.json"
-
-def get_users():
-    if not os.path.isfile(USERS_FILE):
+# helpers pra ler e salvar json
+def load_json(file_path):
+    if not file_path.exists():
         return {}
-    with open(USERS_FILE, "r") as f:
+    with open(file_path, "r", encoding="utf-8") as f:
         return json.load(f)
 
-def save_users(users):
-    with open(USERS_FILE, "w") as f:
-        json.dump(users, f, indent=2)
+def save_json(file_path, data):
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
-def verify_password(plain_password, hashed_password):
-    return pwd_context.verify(plain_password, hashed_password)
-
-def get_password_hash(password):
-    return pwd_context.hash(password)
-
-def authenticate_admin(username: str, password: str):
-    return username == ADMIN_USERNAME and password == ADMIN_PASSWORD
-
-def authenticate_user(username: str, password: str):
-    users = get_users()
-    if username not in users:
-        return False
-    if not verify_password(password, users[username]["password"]):
-        return False
-    return User(username=username)
-
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
-    to_encode = data.copy()
-    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
-    to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+# modelos
+class UserIn(BaseModel):
+    username: str
+    password: str
 
 class Token(BaseModel):
     access_token: str
     token_type: str
 
-class User(BaseModel):
-    username: str
-
-class UserIn(BaseModel):
-    username: str
-    password: str
-
-@app.post("/token", response_model=Token)
-async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
-    if authenticate_admin(form_data.username, form_data.password):
-        access_token = create_access_token(data={"sub": ADMIN_USERNAME})
-        return {"access_token": access_token, "token_type": "bearer"}
-
-    user = authenticate_user(form_data.username, form_data.password)
-    if not user:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Usuário ou senha inválidos")
-    access_token = create_access_token(data={"sub": user.username})
-    return {"access_token": access_token, "token_type": "bearer"}
-
-@app.post("/register")
-async def register(user_in: UserIn):
-    users = get_users()
-    if user_in.username == ADMIN_USERNAME:
-        raise HTTPException(status_code=400, detail="Não pode registrar com esse usuário")
-    if user_in.username in users:
-        raise HTTPException(status_code=400, detail="Usuário já existe")
-    hashed = get_password_hash(user_in.password)
-    users[user_in.username] = {"password": hashed}
-    save_users(users)
-    return {"msg": "Registrado com sucesso"}
-
-# modelo da tarefa
 class Task(BaseModel):
     id: int
     title: str
     done: bool = False
-    owner: str
 
-tasks = []
+class TaskUpdate(BaseModel):
+    done: Optional[bool] = None
+    title: Optional[str] = None
+
+# utils senha e token
+def verify_password(plain, hashed):
+    return pwd_context.verify(plain, hashed)
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=15))
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+def get_user(username: str):
+    users = load_json(USERS_FILE)
+    user = users.get(username)
+    if user:
+        return user
+    return None
+
+def authenticate_user(username: str, password: str):
+    user = get_user(username)
+    if not user:
+        return False
+    if not verify_password(password, user["hashed_password"]):
+        return False
+    return user
+
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    credentials_ex = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="não autorizado",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_ex
+    except JWTError:
+        raise credentials_ex
+    user = get_user(username)
+    if user is None:
+        raise credentials_ex
+    return username
+
+# rotas
+
+@app.post("/register")
+def register(user_in: UserIn):
+    users = load_json(USERS_FILE)
+    if user_in.username in users:
+        raise HTTPException(status_code=400, detail="username já existe")
+    hashed = get_password_hash(user_in.password)
+    users[user_in.username] = {"hashed_password": hashed}
+    save_json(USERS_FILE, users)
+    tasks = load_json(TASKS_FILE)
+    tasks[user_in.username] = []
+    save_json(TASKS_FILE, tasks)
+    return {"msg": "usuário criado"}
+
+@app.post("/token", response_model=Token)
+def login(form: OAuth2PasswordRequestForm = Depends()):
+    user = authenticate_user(form.username, form.password)
+    if not user:
+        raise HTTPException(status_code=400, detail="usuário ou senha inválidos")
+    token = create_access_token({"sub": form.username}, timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    return {"access_token": token, "token_type": "bearer"}
 
 @app.get("/tasks", response_model=List[Task])
-async def get_tasks(token: str = Depends(oauth2_scheme)):
-    payload = None
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Token inválido")
-    username = payload.get("sub")
-    if username is None:
-        raise HTTPException(status_code=401, detail="Token inválido")
-
-    # admin vê tudo
-    if username == ADMIN_USERNAME:
-        return tasks
-
-    # usuário normal só vê as próprias tarefas
-    return [t for t in tasks if t.owner == username]
+def get_tasks(current_user: str = Depends(get_current_user)):
+    tasks = load_json(TASKS_FILE)
+    return tasks.get(current_user, [])
 
 @app.post("/tasks")
-async def create_task(task: Task, token: str = Depends(oauth2_scheme)):
-    payload = None
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Token inválido")
-    username = payload.get("sub")
-    if username is None:
-        raise HTTPException(status_code=401, detail="Token inválido")
-
-    if any(t.id == task.id for t in tasks):
-        raise HTTPException(status_code=400, detail="ID já existe")
-
-    # garante dono certo
-    task.owner = username
-    tasks.append(task)
-    return {"msg": "Tarefa criada"}
-
-@app.patch("/tasks/{task_id}")
-async def update_task(task_id: int, done: bool, token: str = Depends(oauth2_scheme)):
-    payload = None
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Token inválido")
-    username = payload.get("sub")
-    if username is None:
-        raise HTTPException(status_code=401, detail="Token inválido")
-
-    for t in tasks:
-        if t.id == task_id:
-            if username != ADMIN_USERNAME and t.owner != username:
-                raise HTTPException(status_code=403, detail="Sem permissão")
-            t.done = done
-            return {"msg": "Atualizado"}
-    raise HTTPException(status_code=404, detail="Tarefa não encontrada")
+def create_task(task: Task, current_user: str = Depends(get_current_user)):
+    tasks = load_json(TASKS_FILE)
+    user_tasks = tasks.get(current_user, [])
+    if any(t["id"] == task.id for t in user_tasks):
+        raise HTTPException(status_code=400, detail="id já existe, doido!")
+    user_tasks.append(task.dict())
+    tasks[current_user] = user_tasks
+    save_json(TASKS_FILE, tasks)
+    return {"message": "tarefa criada", "task": task}
 
 @app.delete("/tasks/{task_id}")
-async def delete_task(task_id: int, token: str = Depends(oauth2_scheme)):
-    payload = None
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Token inválido")
-    username = payload.get("sub")
-    if username is None:
-        raise HTTPException(status_code=401, detail="Token inválido")
+def delete_task(task_id: int, current_user: str = Depends(get_current_user)):
+    tasks = load_json(TASKS_FILE)
+    user_tasks = tasks.get(current_user, [])
+    new_tasks = [t for t in user_tasks if t["id"] != task_id]
+    if len(new_tasks) == len(user_tasks):
+        raise HTTPException(status_code=404, detail="tarefa não encontrada")
+    tasks[current_user] = new_tasks
+    save_json(TASKS_FILE, tasks)
+    return {"message": f"tarefa com id {task_id} deletada"}
 
-    global tasks
-    for t in tasks:
-        if t.id == task_id:
-            if username != ADMIN_USERNAME and t.owner != username:
-                raise HTTPException(status_code=403, detail="Sem permissão")
-            tasks = [task for task in tasks if task.id != task_id]
-            return {"msg": "Deletado"}
-    raise HTTPException(status_code=404, detail="Tarefa não encontrada")
+@app.patch("/tasks/{task_id}")
+def update_task(task_id: int, task_update: TaskUpdate, current_user: str = Depends(get_current_user)):
+    tasks = load_json(TASKS_FILE)
+    user_tasks = tasks.get(current_user, [])
+    for t in user_tasks:
+        if t["id"] == task_id:
+            if task_update.done is not None:
+                t["done"] = task_update.done
+            if task_update.title is not None:
+                t["title"] = task_update.title
+            tasks[current_user] = user_tasks
+            save_json(TASKS_FILE, tasks)
+            return {"message": "tarefa atualizada", "task": t}
+    raise HTTPException(status_code=404, detail="tarefa não encontrada")
