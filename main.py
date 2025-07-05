@@ -1,16 +1,15 @@
-from fastapi import FastAPI, HTTPException, Depends, status
-from fastapi.security import OAuth2PasswordRequestForm, OAuth2PasswordBearer
+from fastapi import FastAPI, HTTPException, Depends, Request, Form
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
 from passlib.context import CryptContext
 from jose import JWTError, jwt
-from typing import Optional
-import json
-import os
+import json, os, zipfile
+from datetime import datetime, timedelta
 
 app = FastAPI()
 
-# CORS
 origins = ["https://kiti.dev", "http://localhost:5500"]
 app.add_middleware(
     CORSMiddleware,
@@ -20,168 +19,155 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# admin fixo (user + senha hash)
-ADMIN_USERNAME = "admin"
-ADMIN_PASSWORD_HASH = "$2b$12$TmLyV/RjQyxTR1qGqxw2auUw6H7jL3CRxMY2dBfiC1mT2fQo8ZbGq"  # hash de "supersecreta"
-
+SECRET_KEY = "minha_chave_super_secreta"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-# JWT config
-SECRET_KEY = "umsegredomuitoseguroquenaoseidevender"
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60*24*7  # 7 dias
+DATA_FILE = "tasks.json"
+USER_FILE = "users.json"
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+# modelos
+class Task(BaseModel):
+    id: int
+    title: str
+    done: bool = False
 
-USERS_FILE = "users.json"
-
-# Modelos
-class UserIn(BaseModel):
+class User(BaseModel):
     username: str
     password: str
 
-class UserOut(BaseModel):
-    username: str
+# helpers
+def load_tasks():
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, "r") as f:
+            return json.load(f)
+    return []
 
-class Token(BaseModel):
-    access_token: str
-    token_type: str
-
-# Helpers
-def verify_password(plain_password, hashed_password):
-    return pwd_context.verify(plain_password, hashed_password)
-
-def get_password_hash(password):
-    return pwd_context.hash(password)
+def save_tasks(tasks):
+    with open(DATA_FILE, "w") as f:
+        json.dump(tasks, f)
 
 def load_users():
-    if not os.path.isfile(USERS_FILE):
+    if not os.path.exists(USER_FILE):
         return {}
-    with open(USERS_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+    with open(USER_FILE, "r") as f:
+        try:
+            return json.load(f)
+        except:
+            return {}
 
 def save_users(users):
-    with open(USERS_FILE, "w", encoding="utf-8") as f:
-        json.dump(users, f, indent=2)
+    with open(USER_FILE, "w") as f:
+        json.dump(users, f)
 
-def authenticate_admin(username: str, password: str):
-    if username == ADMIN_USERNAME and verify_password(password, ADMIN_PASSWORD_HASH):
-        return True
-    return False
+def verify_password(plain, hashed):
+    return pwd_context.verify(plain, hashed)
 
-def authenticate_user(username: str, password: str):
+def hash_password(pw):
+    return pwd_context.hash(pw)
+
+def authenticate_user(username, password):
+    if username == "admin":
+        return password == "admin123"  # admin fixo
     users = load_users()
     if username in users and verify_password(password, users[username]["password"]):
         return True
     return False
 
-def create_access_token(data: dict):
-    from datetime import datetime, timedelta
+def create_token(data: dict, expires_delta: timedelta = None):
     to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
-async def get_current_user(token: str = Depends(oauth2_scheme)):
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="token inválido ou expirado",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
+def get_current_user(token: str = Depends(oauth2_scheme)):
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username: str = payload.get("sub")
-        if username is None:
-            raise credentials_exception
-        is_admin = payload.get("admin", False)
+        return payload.get("sub")
     except JWTError:
-        raise credentials_exception
-    return {"username": username, "admin": is_admin}
+        raise HTTPException(status_code=401, detail="Token inválido")
 
-async def get_admin_user(current_user=Depends(get_current_user)):
-    if not current_user["admin"]:
-        raise HTTPException(status_code=403, detail="não autorizado, só admin pode")
-    return current_user
-
-# Rotas
+# rotas
+@app.post("/token")
+async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    if not authenticate_user(form_data.username, form_data.password):
+        raise HTTPException(status_code=400, detail="Credenciais inválidas")
+    token = create_token({"sub": form_data.username})
+    return {"access_token": token, "token_type": "bearer"}
 
 @app.post("/register")
-def register(user: UserIn):
-    if user.username == ADMIN_USERNAME:
-        raise HTTPException(status_code=400, detail="esse usuário é reservado")
+async def register(user: User):
+    if user.username == "admin":
+        raise HTTPException(status_code=400, detail="Este nome é reservado")
     users = load_users()
     if user.username in users:
-        raise HTTPException(status_code=400, detail="usuário já existe")
-    hashed = get_password_hash(user.password)
-    users[user.username] = {"password": hashed}
+        raise HTTPException(status_code=400, detail="Usuário já existe")
+    users[user.username] = {"password": hash_password(user.password)}
     save_users(users)
-    return {"msg": "usuário registrado"}
+    return {"message": "Usuário registrado"}
 
-@app.post("/token", response_model=Token)
-def login(form_data: OAuth2PasswordRequestForm = Depends()):
-    # admin check
-    if authenticate_admin(form_data.username, form_data.password):
-        access_token = create_access_token(data={"sub": ADMIN_USERNAME, "admin": True})
-        return {"access_token": access_token, "token_type": "bearer"}
+@app.get("/")
+def root():
+    return {"message": "KitiTasks API :3"}
 
-    # user check
-    if authenticate_user(form_data.username, form_data.password):
-        access_token = create_access_token(data={"sub": form_data.username, "admin": False})
-        return {"access_token": access_token, "token_type": "bearer"}
+@app.get("/tasks")
+def get_tasks(current_user: str = Depends(get_current_user)):
+    return [t for t in load_tasks() if t["user"] == current_user]
 
-    raise HTTPException(status_code=400, detail="usuário ou senha inválidos")
+@app.post("/tasks")
+def add_task(task: Task, current_user: str = Depends(get_current_user)):
+    tasks = load_tasks()
+    task.id = max([t["id"] for t in tasks], default=0) + 1
+    tasks.append({**task.dict(), "user": current_user})
+    save_tasks(tasks)
+    return {"message": "Tarefa criada"}
 
-# Agora o sistema de tarefas que todo mundo pode mexer
-
-tasks = {}  # key = username, value = list of tasks
-task_id_counter = 1
-
-class TaskIn(BaseModel):
-    title: str
-    done: Optional[bool] = False
-
-class TaskOut(TaskIn):
-    id: int
-
-@app.get("/tasks", response_model=list[TaskOut])
-async def get_tasks(current_user=Depends(get_current_user)):
-    user = current_user["username"]
-    user_tasks = tasks.get(user, [])
-    return user_tasks
-
-@app.post("/tasks", response_model=TaskOut)
-async def create_task(task: TaskIn, current_user=Depends(get_current_user)):
-    global task_id_counter
-    user = current_user["username"]
-    new_task = {"id": task_id_counter, "title": task.title, "done": task.done}
-    task_id_counter += 1
-    if user not in tasks:
-        tasks[user] = []
-    tasks[user].append(new_task)
-    return new_task
-
-@app.patch("/tasks/{task_id}", response_model=TaskOut)
-async def update_task(task_id: int, task: TaskIn, current_user=Depends(get_current_user)):
-    user = current_user["username"]
-    user_tasks = tasks.get(user, [])
-    for t in user_tasks:
-        if t["id"] == task_id:
-            t["title"] = task.title
-            t["done"] = task.done
-            return t
-    raise HTTPException(status_code=404, detail="tarefa não encontrada")
+@app.patch("/tasks/{task_id}")
+def update_task(task_id: int, done: bool, current_user: str = Depends(get_current_user)):
+    tasks = load_tasks()
+    for t in tasks:
+        if t["id"] == task_id and t["user"] == current_user:
+            t["done"] = done
+            save_tasks(tasks)
+            return {"message": "Atualizado"}
+    raise HTTPException(status_code=404, detail="Tarefa não encontrada")
 
 @app.delete("/tasks/{task_id}")
-async def delete_task(task_id: int, current_user=Depends(get_current_user)):
-    user = current_user["username"]
-    user_tasks = tasks.get(user, [])
-    tasks[user] = [t for t in user_tasks if t["id"] != task_id]
-    return {"msg": "tarefa deletada"}
+def delete_task(task_id: int, current_user: str = Depends(get_current_user)):
+    tasks = load_tasks()
+    tasks = [t for t in tasks if not (t["id"] == task_id and t["user"] == current_user)]
+    save_tasks(tasks)
+    return {"message": "Removida"}
 
-# Rota só pro admin ver o painel
+# rota protegida: só admin vê
+@app.get("/admin.html")
+def get_admin_page(user: str = Depends(get_current_user)):
+    if user != "admin":
+        raise HTTPException(status_code=403, detail="Acesso negado")
+    return FileResponse("admin.html")
 
-@app.get("/adminpanel")
-async def admin_panel(user=Depends(get_admin_user)):
-    # só um json fake pra mostrar que só admin vê
-    return {"msg": "Bem-vindo ao painel admin, rei " + user["username"]}
+# backup export
+@app.get("/backup")
+def export_zip(user: str = Depends(get_current_user)):
+    if user != "admin":
+        raise HTTPException(status_code=403, detail="Só admin")
+    with zipfile.ZipFile("backup.zip", "w") as zipf:
+        for f in [DATA_FILE, USER_FILE]:
+            if os.path.exists(f):
+                zipf.write(f)
+    return FileResponse("backup.zip", media_type="application/zip", filename="backup.zip")
 
+# backup import
+@app.post("/import")
+async def import_backup(request: Request, user: str = Depends(get_current_user)):
+    if user != "admin":
+        raise HTTPException(status_code=403, detail="Só admin")
+    form = await request.form()
+    file = form["file"]
+    with open("imported.zip", "wb") as f:
+        f.write(await file.read())
+    with zipfile.ZipFile("imported.zip", "r") as zipf:
+        zipf.extractall()
+    return {"message": "Importado"}
