@@ -29,7 +29,7 @@ app.add_middleware(
 
 # só o admin hardcoded
 ADMIN_USERNAME = "admin"
-ADMIN_PASSWORD = "supersecreta"  # troca pra senha forte
+ADMIN_PASSWORD = "12022012"  # troca pra senha forte
 
 # fake db de tarefas, vai perder se reiniciar
 tasks = []
